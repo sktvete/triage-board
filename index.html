@@ -92,14 +92,12 @@
   button:hover { filter: brightness(1.08); }
   button:active { transform: translateY(1px); }
   #syncBtn { position: relative; }
-  #syncBtn::after {
-    content: ""; position: absolute; top: -2px; right: -2px; width: 8px; height: 8px;
-    border-radius: 50%; background: var(--muted-dim); border: 1.5px solid var(--bg);
+  .sync-dot {
+    position: absolute; top: -2px; right: -2px; width: 8px; height: 8px;
+    border-radius: 50%; border: 1.5px solid var(--bg); background: var(--muted-dim);
   }
-  #syncBtn[data-state="synced"]::after { background: var(--feature); }
-  #syncBtn[data-state="syncing"]::after { background: var(--medium); }
-  #syncBtn[data-state="error"]::after { background: var(--bug); }
-  #syncBtn[data-state="local-only"]::after { background: var(--muted-dim); }
+  .sync-dot.blink { animation: sync-blink .28s ease-in-out 2; }
+  @keyframes sync-blink { 0%, 100% { opacity: 1; } 50% { opacity: .15; } }
 
   .status-strip {
     display: flex; gap: 16px; padding: 8px 18px; font-size: 11px; color: var(--muted);
@@ -289,7 +287,7 @@
       <option value="low">Low</option>
     </select>
   </div>
-  <button id="syncBtn" class="ghost" title="Sync settings">⇅</button>
+  <button id="syncBtn" class="ghost" title="Sync settings">⇅<span id="syncDot" class="sync-dot"></span></button>
   <button id="refreshBtn" class="ghost">↻ Refresh</button>
 </header>
 
@@ -386,9 +384,11 @@ function b64DecodeUtf8(str) {
   return decodeURIComponent(escape(atob(str.replace(/\n/g, ""))));
 }
 
-async function pushRemoteState(id, patch) {
+async function pushRemoteState(patches) {
   const token = getGithubToken();
   if (!token) return { ok: false, reason: "no-token" };
+  const ids = Object.keys(patches);
+  if (!ids.length) return { ok: true };
   try {
     const getRes = await fetch(API_CONTENTS_URL, {
       headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" },
@@ -401,9 +401,11 @@ async function pushRemoteState(id, patch) {
     } else if (getRes.status !== 404) {
       throw new Error(`GET ${getRes.status}`);
     }
-    current[id] = { ...current[id], ...patch };
+    for (const id of ids) {
+      current[id] = { ...current[id], ...patches[id] };
+    }
     const body = {
-      message: `Triage: update ${id}`,
+      message: `Triage: update ${ids.length} item${ids.length === 1 ? "" : "s"}`,
       content: b64EncodeUtf8(JSON.stringify(current, null, 2)),
       branch: "main",
     };
@@ -476,20 +478,79 @@ async function loadItems() {
   render();
 }
 
-async function patchState(id, patch) {
+const PUSH_DELAY_MS = 5000;
+const DOT_RED = [255, 93, 93];    // matches --bug
+const DOT_GREEN = [53, 217, 168]; // matches --feature
+const DOT_GRAY = [91, 98, 116];   // matches --muted-dim
+let pendingPatches = {};
+let pendingTimer = null;
+let fadeRAF = null;
+
+function setDotColorRgb(rgb) {
+  const dot = document.getElementById("syncDot");
+  if (dot) dot.style.backgroundColor = `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
+}
+
+// Drives the red→green fade manually via rAF instead of a CSS transition —
+// CSS transitions were unreliable to trigger consistently across environments,
+// so this interpolates the color every frame for a result we can trust.
+function startFadeToGreen(durationMs) {
+  if (fadeRAF) cancelAnimationFrame(fadeRAF);
+  const start = performance.now();
+  function step(now) {
+    const t = Math.min(1, (now - start) / durationMs);
+    const rgb = DOT_RED.map((v, i) => Math.round(v + (DOT_GREEN[i] - v) * t));
+    setDotColorRgb(rgb);
+    if (t < 1) fadeRAF = requestAnimationFrame(step);
+    else fadeRAF = null;
+  }
+  fadeRAF = requestAnimationFrame(step);
+}
+function stopFade() {
+  if (fadeRAF) cancelAnimationFrame(fadeRAF);
+  fadeRAF = null;
+}
+
+function patchState(id, patch) {
   const state = loadLocalState();
   state[id] = { ...state[id], ...patch };
   saveLocalState(state);
 
   if (!getGithubToken()) {
     syncStatus = "local-only";
+    stopFade();
     updateSyncIndicator();
     return;
   }
+
+  pendingPatches[id] = { ...pendingPatches[id], ...patch };
+  syncStatus = "pending";
+  updateSyncIndicator();
+  setDotColorRgb(DOT_RED);
+  startFadeToGreen(PUSH_DELAY_MS);
+
+  if (pendingTimer) clearTimeout(pendingTimer);
+  pendingTimer = setTimeout(flushPending, PUSH_DELAY_MS);
+}
+
+async function flushPending() {
+  pendingTimer = null;
+  const patches = pendingPatches;
+  pendingPatches = {};
+  if (!Object.keys(patches).length) return;
+
+  stopFade();
+  setDotColorRgb(DOT_GREEN);
   syncStatus = "syncing";
   updateSyncIndicator();
-  const result = await pushRemoteState(id, patch);
+  const dot = document.getElementById("syncDot");
+  if (dot) dot.classList.add("blink");
+
+  const result = await pushRemoteState(patches);
+
+  if (dot) dot.classList.remove("blink");
   syncStatus = result.ok ? "synced" : "error";
+  setDotColorRgb(result.ok ? DOT_GREEN : DOT_RED);
   if (!result.ok) console.warn("Sync failed:", result.reason);
   updateSyncIndicator();
 }
@@ -499,15 +560,23 @@ function updateSyncIndicator() {
   const btn = document.getElementById("syncBtn");
   const labels = {
     idle: getGithubToken() ? "sync ready" : "local only",
-    syncing: "syncing…",
+    pending: "saving in 5s…",
+    syncing: "pushing…",
     synced: "synced ✓",
     "local-only": "local only (no token)",
     error: "sync failed — saved locally",
   };
   if (el) el.textContent = labels[syncStatus] || "";
-  if (btn) {
-    btn.dataset.state = syncStatus === "idle" ? (getGithubToken() ? "synced" : "local-only") : syncStatus;
-    btn.title = labels[syncStatus] || "Sync settings";
+  if (btn) btn.title = labels[syncStatus] || "Sync settings";
+  if (btn && (syncStatus === "idle" || syncStatus === "synced" || syncStatus === "local-only" || syncStatus === "error")) {
+    const staticColor = {
+      idle: getGithubToken() ? DOT_GREEN : DOT_GRAY,
+      synced: DOT_GREEN,
+      "local-only": DOT_GRAY,
+      error: DOT_RED,
+    }[syncStatus];
+    stopFade();
+    setDotColorRgb(staticColor);
   }
 }
 
