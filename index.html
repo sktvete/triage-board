@@ -476,7 +476,6 @@ function renderCard(it, colId) {
   card.querySelector('[data-act="move"]').addEventListener("change", (e) => {
     it.status = e.target.value;
     patchLocal(it.id, { status: it.status });
-    mobileStatus = it.status;
     render();
   });
   return card;
