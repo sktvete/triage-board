@@ -91,6 +91,15 @@
   button.ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
   button:hover { filter: brightness(1.08); }
   button:active { transform: translateY(1px); }
+  #syncBtn { position: relative; }
+  #syncBtn::after {
+    content: ""; position: absolute; top: -2px; right: -2px; width: 8px; height: 8px;
+    border-radius: 50%; background: var(--muted-dim); border: 1.5px solid var(--bg);
+  }
+  #syncBtn[data-state="synced"]::after { background: var(--feature); }
+  #syncBtn[data-state="syncing"]::after { background: var(--medium); }
+  #syncBtn[data-state="error"]::after { background: var(--bug); }
+  #syncBtn[data-state="local-only"]::after { background: var(--muted-dim); }
 
   .status-strip {
     display: flex; gap: 16px; padding: 8px 18px; font-size: 11px; color: var(--muted);
@@ -276,6 +285,7 @@
       <option value="low">Low</option>
     </select>
   </div>
+  <button id="syncBtn" class="ghost" title="Sync settings">⇅</button>
   <button id="refreshBtn" class="ghost">↻ Refresh</button>
 </header>
 
@@ -283,6 +293,7 @@
   <span>reports: <b id="statTotal">–</b></span>
   <span>bugs: <b id="statBugs">–</b></span>
   <span>features: <b id="statFeatures">–</b></span>
+  <span id="syncState">–</span>
   <span id="statUpdated">–</span>
 </div>
 
@@ -299,11 +310,34 @@
   </div>
 </dialog>
 
+<dialog id="syncDlg">
+  <h2 style="margin:0 0 4px;font-size:16px;">Sync across devices</h2>
+  <p style="font-size:12.5px;color:var(--muted);line-height:1.5;margin-top:8px;">
+    Status and priority changes are read from a shared file in the
+    <code class="mono">triage-board</code> repo, so every device sees the same board.
+    To let <b>this device</b> save changes there too, paste a GitHub token scoped to
+    just that repo (Contents: read and write). Without a token, this device can still
+    view shared changes but its own edits stay local only.
+  </p>
+  <label>GitHub token</label>
+  <input type="text" id="tokenInput" placeholder="github_pat_…" class="mono" style="width:100%;">
+  <div class="dialog-actions">
+    <button type="button" class="ghost" id="tokenClearBtn">Clear</button>
+    <button type="button" class="ghost" id="syncCloseBtn">Close</button>
+    <button type="button" id="tokenSaveBtn">Save</button>
+  </div>
+</dialog>
+
 <script src="https://cdn.apple-cloudkit.com/ck/2/cloudkit.js"></script>
 <script>
 const CONTAINER_ID = "iCloud.com.sindretvete.spacerush";
 const API_TOKEN = "776a03c5c5ed20dbc16280f2d061fb120ce02751687d515999ca66d7a37d9c91";
 const STATE_KEY = "triage-local-state-v1";
+const GITHUB_TOKEN_KEY = "triage-github-token";
+const GITHUB_REPO = "sktvete/triage-board";
+const STATE_FILE = "state.json";
+const RAW_STATE_URL = `https://raw.githubusercontent.com/${GITHUB_REPO}/main/${STATE_FILE}`;
+const API_CONTENTS_URL = `https://api.github.com/repos/${GITHUB_REPO}/contents/${STATE_FILE}`;
 
 const COLUMNS = [
   { id: "backlog",   label: "Backlog" },
@@ -314,12 +348,79 @@ const COLUMNS = [
 
 let items = [];
 let loadError = null;
+let syncStatus = "idle"; // idle | synced | local-only | error
 
 function loadLocalState() {
   try { return JSON.parse(localStorage.getItem(STATE_KEY) || "{}"); } catch { return {}; }
 }
 function saveLocalState(state) {
   localStorage.setItem(STATE_KEY, JSON.stringify(state));
+}
+
+function getGithubToken() {
+  return localStorage.getItem(GITHUB_TOKEN_KEY) || "";
+}
+function setGithubToken(token) {
+  if (token) localStorage.setItem(GITHUB_TOKEN_KEY, token);
+  else localStorage.removeItem(GITHUB_TOKEN_KEY);
+}
+
+async function fetchRemoteState() {
+  try {
+    const res = await fetch(`${RAW_STATE_URL}?t=${Date.now()}`, { cache: "no-store" });
+    if (!res.ok) return {};
+    return await res.json();
+  } catch {
+    return {};
+  }
+}
+
+function b64EncodeUtf8(str) {
+  return btoa(unescape(encodeURIComponent(str)));
+}
+function b64DecodeUtf8(str) {
+  return decodeURIComponent(escape(atob(str.replace(/\n/g, ""))));
+}
+
+async function pushRemoteState(id, patch) {
+  const token = getGithubToken();
+  if (!token) return { ok: false, reason: "no-token" };
+  try {
+    const getRes = await fetch(API_CONTENTS_URL, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" },
+    });
+    let sha, current = {};
+    if (getRes.ok) {
+      const data = await getRes.json();
+      sha = data.sha;
+      current = JSON.parse(b64DecodeUtf8(data.content));
+    } else if (getRes.status !== 404) {
+      throw new Error(`GET ${getRes.status}`);
+    }
+    current[id] = { ...current[id], ...patch };
+    const body = {
+      message: `Triage: update ${id}`,
+      content: b64EncodeUtf8(JSON.stringify(current, null, 2)),
+      branch: "main",
+    };
+    if (sha) body.sha = sha;
+    const putRes = await fetch(API_CONTENTS_URL, {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/vnd.github+json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    if (!putRes.ok) {
+      const errBody = await putRes.text();
+      throw new Error(`PUT ${putRes.status}: ${errBody.slice(0, 150)}`);
+    }
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, reason: (e && e.message) || String(e) };
+  }
 }
 
 function fieldVal(fields, key, fallback) {
@@ -336,11 +437,15 @@ async function loadItems() {
       }],
     });
     const db = CloudKit.getDefaultContainer().publicCloudDatabase;
-    const res = await db.performQuery({ recordType: "Feedback" });
-    const state = loadLocalState();
+    const [res, remoteState] = await Promise.all([
+      db.performQuery({ recordType: "Feedback" }),
+      fetchRemoteState(),
+    ]);
+    const localState = loadLocalState();
     items = res.records.map(r => {
       const f = r.fields;
-      const local = state[r.recordName] || {};
+      const remote = remoteState[r.recordName] || {};
+      const local = localState[r.recordName] || {};
       const attachment = f.attachment && f.attachment.value;
       return {
         id: r.recordName,
@@ -354,8 +459,8 @@ async function loadItems() {
         player: fieldVal(f, "playerName", ""),
         created: fieldVal(f, "createdAt", null),
         screenshotUrl: attachment ? attachment.downloadURL : null,
-        status: local.status || "backlog",
-        priority: local.priority || "medium",
+        status: remote.status || local.status || "backlog",
+        priority: remote.priority || local.priority || "medium",
       };
     });
     items.sort((a, b) => (b.created || 0) - (a.created || 0));
@@ -367,10 +472,39 @@ async function loadItems() {
   render();
 }
 
-function patchLocal(id, patch) {
+async function patchState(id, patch) {
   const state = loadLocalState();
   state[id] = { ...state[id], ...patch };
   saveLocalState(state);
+
+  if (!getGithubToken()) {
+    syncStatus = "local-only";
+    updateSyncIndicator();
+    return;
+  }
+  syncStatus = "syncing";
+  updateSyncIndicator();
+  const result = await pushRemoteState(id, patch);
+  syncStatus = result.ok ? "synced" : "error";
+  if (!result.ok) console.warn("Sync failed:", result.reason);
+  updateSyncIndicator();
+}
+
+function updateSyncIndicator() {
+  const el = document.getElementById("syncState");
+  const btn = document.getElementById("syncBtn");
+  const labels = {
+    idle: getGithubToken() ? "sync ready" : "local only",
+    syncing: "syncing…",
+    synced: "synced ✓",
+    "local-only": "local only (no token)",
+    error: "sync failed — saved locally",
+  };
+  if (el) el.textContent = labels[syncStatus] || "";
+  if (btn) {
+    btn.dataset.state = syncStatus === "idle" ? (getGithubToken() ? "synced" : "local-only") : syncStatus;
+    btn.title = labels[syncStatus] || "Sync settings";
+  }
 }
 
 const board = document.getElementById("board");
@@ -378,6 +512,7 @@ const search = document.getElementById("search");
 const typeFilter = document.getElementById("typeFilter");
 const prioFilter = document.getElementById("prioFilter");
 const dlg = document.getElementById("dlg");
+const syncDlg = document.getElementById("syncDlg");
 const banner = document.getElementById("banner");
 const tabsEl = document.getElementById("tabs");
 let mobileStatus = "backlog";
@@ -408,6 +543,7 @@ function render() {
     banner.style.display = "none";
   }
   updateStats();
+  updateSyncIndicator();
   board.innerHTML = "";
   const list = filtered();
 
@@ -470,13 +606,13 @@ function renderCard(it, colId) {
   card.querySelector('[data-act="view"]').addEventListener("click", () => openDetail(it.id));
   card.querySelector('[data-act="priority"]').addEventListener("change", (e) => {
     it.priority = e.target.value;
-    patchLocal(it.id, { priority: it.priority });
     render();
+    patchState(it.id, { priority: it.priority });
   });
   card.querySelector('[data-act="move"]').addEventListener("change", (e) => {
     it.status = e.target.value;
-    patchLocal(it.id, { status: it.status });
     render();
+    patchState(it.id, { status: it.status });
   });
   return card;
 }
@@ -489,8 +625,8 @@ function addDropHandlers(cardsEl) {
     if (!dragging) return;
     const it = items.find(x => x.id === dragging.dataset.id);
     it.status = cardsEl.dataset.status;
-    patchLocal(it.id, { status: it.status });
     render();
+    patchState(it.id, { status: it.status });
   });
 }
 
@@ -521,6 +657,25 @@ function openDetail(id) {
 document.getElementById("closeBtn").addEventListener("click", () => dlg.close());
 document.getElementById("refreshBtn").addEventListener("click", () => loadItems());
 [search, typeFilter, prioFilter].forEach(el => el.addEventListener("input", render));
+
+const tokenInput = document.getElementById("tokenInput");
+document.getElementById("syncBtn").addEventListener("click", () => {
+  tokenInput.value = getGithubToken();
+  syncDlg.showModal();
+});
+document.getElementById("syncCloseBtn").addEventListener("click", () => syncDlg.close());
+document.getElementById("tokenSaveBtn").addEventListener("click", () => {
+  setGithubToken(tokenInput.value.trim());
+  syncStatus = "idle";
+  updateSyncIndicator();
+  syncDlg.close();
+});
+document.getElementById("tokenClearBtn").addEventListener("click", () => {
+  setGithubToken("");
+  tokenInput.value = "";
+  syncStatus = "idle";
+  updateSyncIndicator();
+});
 
 loadItems();
 </script>
